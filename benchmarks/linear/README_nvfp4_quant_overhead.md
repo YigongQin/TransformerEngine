@@ -46,6 +46,32 @@ summed from the per-GEMM rows: X and dY are each consumed by two GEMMs, so summi
 charges them twice through two single-usage casts instead of one dual-usage cast,
 and overstates quantization badly (42% vs 38.3% for dense MoE below).
 
+### Prefer the step rows over the per-GEMM rows
+
+Every per-GEMM row carries a **fixed ~10–25 µs penalty** that a real training pass
+pays roughly once rather than three times. It shows up as `overhead us` exceeding
+`quant us` in essentially every per-GEMM row, which is impossible if
+`total = quant + gemm`.
+
+The cause is GPU-side, not CPU dispatch (measured: 66 µs CPU vs 113 µs GPU for a
+full loop, so the loop is GPU-bound). About half is **L2 cold-cache**: in the
+`gemm`-only loop, consecutive identical GEMMs keep their operands resident in
+B200's ~126 MB L2, but in `quant+gemm` the cast evicts them and the GEMM re-reads
+from HBM. Measured directly on the grouped fc1 at 512 tok/E, the same GEMM takes
+61.5 µs back-to-back and 104.2 µs after an explicit L2 flush (flush itself
+36.8 µs) — a +5.8 µs cold penalty. The remainder is kernel-boundary effects.
+
+So the `gemm` baseline is measured cache-warm in a way production never is, which
+understates it and inflates `overhead`. The penalty is roughly fixed, so it
+distorts short GEMMs most — exactly the MoE shapes.
+
+Concretely, at 512 tok/E the three grouped rows sum to 179.8 µs of overhead
+against a measured step of 94.6 µs. Of that 85 µs gap, 54 µs is the double-cast
+above and ~33 µs is this fixed penalty counted three times.
+
+**Read the per-GEMM tables for the relative ordering of fprop/dgrad/wgrad, and the
+step tables for the actual quantization fraction.**
+
 ---
 
 # Part 1 — Dense
