@@ -41,10 +41,26 @@ optimizer step and reused across microbatches, so its cost is excluded. Without
 it, the weight is re-cast every step (microbatch = 1).
 
 `--step-total` measures one full training pass — all three GEMMs with X, W and dY
-each cast **once** using a fused rowwise+columnwise kernel. Measured directly, not
-summed from the per-GEMM rows: X and dY are each consumed by two GEMMs, so summing
-charges them twice through two single-usage casts instead of one dual-usage cast,
-and overstates quantization badly (42% vs 38.3% for dense MoE below).
+each cast **once**. Measured directly, never summed from the per-GEMM rows.
+
+The reason summing is wrong is the **fused cast + cast-transpose**: one kernel
+reads a tensor once and writes both the rowwise and columnwise layouts. The
+per-GEMM bench needs two quantized operands per GEMM, so across three GEMMs it
+performs **6 single-usage casts**; a training pass performs **3 fused dual-usage
+casts** over X, W and dY. With the weight amortized that is 4 casts versus 2.
+
+The saving is entirely in *reads*, not writes — both produce the same two output
+layouts. For the grouped fc1 at 512 tok/E:
+
+| | casts | read | write | total traffic |
+| --- | --- | --- | --- | --- |
+| per-GEMM (summed) | 4 single-usage | 184.5 MB | 51.9 MB | 236.5 MB |
+| one training pass | 2 fused dual-usage | 92.3 MB | 51.9 MB | 144.2 MB |
+
+That predicts the step doing 39% less cast traffic; measured `quant us` is 37%
+lower (92.6 vs 146.6 µs). The agreement is close enough to conclude the cast is
+bandwidth-bound and that this gap is real physics rather than a measurement
+artifact — unlike the penalty described next.
 
 ### Prefer the step rows over the per-GEMM rows
 
@@ -66,8 +82,10 @@ understates it and inflates `overhead`. The penalty is roughly fixed, so it
 distorts short GEMMs most — exactly the MoE shapes.
 
 Concretely, at 512 tok/E the three grouped rows sum to 179.8 µs of overhead
-against a measured step of 94.6 µs. Of that 85 µs gap, 54 µs is the double-cast
-above and ~33 µs is this fixed penalty counted three times.
+against a measured step of 94.6 µs. That 85 µs gap splits cleanly: **54 µs is the
+redundant input reads** described above (real, and correctly absent from a
+training pass) and **~33 µs is this fixed penalty** counted three times (a
+measurement artifact).
 
 **Read the per-GEMM tables for the relative ordering of fprop/dgrad/wgrad, and the
 step tables for the actual quantization fraction.**
