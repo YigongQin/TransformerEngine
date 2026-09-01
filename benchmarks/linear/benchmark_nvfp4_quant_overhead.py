@@ -83,6 +83,7 @@ import argparse
 
 import pandas as pd
 import torch
+from torch.profiler import ProfilerActivity, profile
 
 import transformer_engine.pytorch as te  # noqa: F401  must be first per te-python-import-order
 import transformer_engine_torch as tex
@@ -256,6 +257,70 @@ def time_us(fn, iters, warmup, repeats, lead_fn=None):
     return best
 
 
+def quant_breakdown(run_quant, iters=20):
+    """Split one cast into amax vs cast GPU time, in us per call.
+
+    An NVFP4 cast is a full-tensor amax pass followed by a cast pass. Everything
+    that is not amax (the cast kernel, plus any scale-swizzle or copy the path
+    happens to emit) is bucketed as ``cast``, so the two columns sum to the
+    measured ``quant us``.
+    """
+    for _ in range(5):
+        run_quant()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(iters):
+            run_quant()
+        torch.cuda.synchronize()
+
+    totals = {"amax": 0.0, "cast": 0.0}
+    for evt in prof.key_averages():
+        if evt.device_type.name != "CUDA" or evt.self_device_time_total <= 0:
+            continue
+        phase = "amax" if "amax" in evt.key.lower() else "cast"
+        totals[phase] += evt.self_device_time_total
+    return {k: v / iters for k, v in totals.items()}
+
+
+def add_cast_bandwidth(run_quant, row, parts, breakdown):
+    """Return the amax/cast split plus the cast pass's achieved bandwidth."""
+    if not breakdown:
+        return {}
+    out = scaled_breakdown(run_quant, row["quant_us"])
+    mb = cast_bytes(parts) / 1e6
+    cast_us = out.get("cast_us", 0.0)
+    out["cast_mb"] = mb
+    out["cast_gbps"] = mb / 1e3 / (cast_us * 1e-6) if cast_us > 0 else 0.0
+    return out
+
+
+def scaled_breakdown(run_quant, quant_us):
+    """Phase split rescaled so the parts sum to the measured ``quant_us``.
+
+    torch.profiler adds per-kernel overhead, so raw profiled times run ~10-15%
+    high and would otherwise exceed the wall-clock total they decompose. The
+    *proportions* are what the profiler measures reliably; this reports those
+    proportions against the unprofiled total.
+    """
+    raw = quant_breakdown(run_quant)
+    total = sum(raw.values())
+    if total <= 0:
+        return {f"{k}_us": 0.0 for k in raw}
+    return {f"{k}_us": v / total * quant_us for k, v in raw.items()}
+
+
+# Cast-phase traffic: the cast reads each tensor once and writes one layout per
+# usage. The amax pass is a separate read and is excluded -- this is the
+# bandwidth of the cast kernel itself.
+CAST_READ_BYTES = 2.0  # bf16 input
+CAST_WRITE_BYTES = 0.5 + 1 / 16  # fp4 data + fp8 block scale
+
+
+def cast_bytes(parts):
+    """Bytes moved by the cast pass. ``parts`` is [(elems, n_usages), ...]."""
+    return sum(e * (CAST_READ_BYTES + n * CAST_WRITE_BYTES) for e, n in parts)
+
+
 def summarize(label, M, K, N, quant_us, gemm_us, total_us, num_gemms=1):
     """Assemble one result row from the three timed loops."""
     overhead_us = total_us - gemm_us
@@ -319,7 +384,14 @@ def benchmark_one(gemm, M, K, N, args, lead_fn):
     def timed(fn):
         return time_us(fn, args.iters, args.warmup, args.repeats, lead_fn)
 
-    return summarize(gemm, M, K, N, timed(run_quant), timed(run_gemm), timed(run_full))
+    row = summarize(gemm, M, K, N, timed(run_quant), timed(run_gemm), timed(run_full))
+    parts = []
+    if quant_a:
+        parts.append((a_shape[0] * a_shape[1], 1))
+    if quant_b:
+        parts.append((b_shape[0] * b_shape[1], 1))
+    row.update(add_cast_bandwidth(run_quant, row, parts, args.breakdown))
+    return row
 
 
 def benchmark_step(M, K, N, args, lead_fn):
@@ -378,7 +450,7 @@ def benchmark_step(M, K, N, args, lead_fn):
     def timed(fn):
         return time_us(fn, args.iters, args.warmup, args.repeats, lead_fn)
 
-    return summarize(
+    row = summarize(
         "step(3 gemms)",
         M,
         K,
@@ -388,6 +460,11 @@ def benchmark_step(M, K, N, args, lead_fn):
         timed(run_full),
         num_gemms=3,
     )
+    parts = [(M * K, 2), (M * N, 2)]
+    if not args.amortize_weight:
+        parts.append((N * K, 2))
+    row.update(add_cast_bandwidth(run_quant, row, parts, args.breakdown))
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +483,10 @@ def report(frame, title, per_gemm=True):
     columns = ["layer", "(M,N,K)"]
     if per_gemm:
         columns.append("gemm")
-    columns += ["gemm_us", "quant_us", "total_us", "overhead_us", "quant_pct"]
+    columns += ["gemm_us", "quant_us"]
+    if "amax_us" in table:
+        columns += ["amax_us", "cast_us", "cast_gbps"]
+    columns += ["total_us", "overhead_us", "quant_pct"]
     if not per_gemm:
         columns.append("gemm_tflops")
 
@@ -414,9 +494,12 @@ def report(frame, title, per_gemm=True):
         columns={
             "gemm_us": "gemm us",
             "quant_us": "quant us",
+            "amax_us": "amax us",
+            "cast_us": "cast us",
+            "cast_gbps": "cast GB/s",
             "total_us": "total us",
             "overhead_us": "overhead us",
-            "quant_pct": "quant %",
+            "quant_pct": "amax+cast %",
             "gemm_tflops": "GEMM TFLOP/s",
         }
     )
@@ -506,6 +589,15 @@ def parse_args():
             " swizzle then sits inside both the gemm and total measurements."
         ),
     )
+    parser.add_argument(
+        "--breakdown",
+        action="store_true",
+        help=(
+            "Split the quant column into its amax / cast / swizzle kernels via"
+            " torch.profiler. An NVFP4 cast is a full-tensor amax pass followed by"
+            " a cast pass, and amax alone is roughly half the traffic."
+        ),
+    )
     parser.add_argument("--iters", type=int, default=50, help="Timed iterations per loop.")
     parser.add_argument(
         "--warmup",
@@ -518,6 +610,11 @@ def parse_args():
     )
     parser.add_argument("-o", "--output", type=str, default=None, help="Write results to CSV.")
     return parser.parse_args()
+
+
+def extra_cols(rows):
+    """Breakdown columns, present only when --breakdown was passed."""
+    return [c for c in ("amax_us", "cast_us", "cast_mb", "cast_gbps") if c in rows[0]]
 
 
 def resolve_layers(spec):
@@ -577,7 +674,7 @@ def main():
     if not rows:
         raise SystemExit("No successful measurements.")
 
-    frame = pd.DataFrame(rows)[RESULT_COLUMNS]
+    frame = pd.DataFrame(rows)[RESULT_COLUMNS + extra_cols(rows)]
     report(frame, "Per-GEMM")
 
     if args.step_total:
@@ -588,7 +685,7 @@ def main():
             lambda layer, M, _: f"{layer} M={M} step",
         )
         if step_rows:
-            step_frame = pd.DataFrame(step_rows)[RESULT_COLUMNS]
+            step_frame = pd.DataFrame(step_rows)[RESULT_COLUMNS + extra_cols(step_rows)]
             report(step_frame, "One training pass: 3 GEMMs, each tensor quantized once", False)
             if args.output:
                 step_out = args.output.replace(".csv", "_step.csv")

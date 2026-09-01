@@ -32,7 +32,7 @@ Both scripts time three loops per GEMM, sharing one set of quantized operands:
 | `quant` | the cast kernels alone |
 | `quant+gemm` | cast, then that same GEMM |
 
-`overhead = (quant+gemm) − gemm`, and `quant %` is that overhead as a fraction of
+`overhead = (quant+gemm) − gemm`, and `amax+cast %` is that overhead as a fraction of
 the full path. Both loops use identical operands and a byte-identical GEMM, so
 the difference isolates the cast.
 
@@ -90,6 +90,33 @@ measurement artifact).
 **Read the per-GEMM tables for the relative ordering of fprop/dgrad/wgrad, and the
 step tables for the actual quantization fraction.**
 
+### The `amax us` / `cast us` / `cast GB/s` columns
+
+An NVFP4 cast is a **two-pass** operation, so `quant us` is split into its parts
+(`--breakdown`, via `torch.profiler`). Everything that is not amax is bucketed as
+`cast`, so the two columns sum to `quant us`:
+
+| config | amax pass | cast pass | separate swizzle? |
+| --- | --- | --- | --- |
+| rowwise, RHT off | 25.1 µs | 22.9 µs | yes, 6.0 µs |
+| columnwise, RHT off | 24.9 µs | 39.7 µs | yes, 6.5 µs |
+| both, RHT off | 26.4 µs | 36.4 µs | yes, 11.8 µs |
+| both, RHT on (Part 2) | 27.0 µs | 44.6 µs | no — fused into the cast |
+
+`torch.profiler` adds ~13% per-kernel overhead, so the split is reported as
+*proportions* rescaled to the unprofiled `quant us`.
+
+**`cast GB/s`** is the cast pass alone — the amax pass is excluded, since it is a
+separate read that produces no output. The cast reads each tensor once and writes
+one layout per usage:
+
+    bytes = elems * (2 + n_usages * 0.5625)     # read bf16; write fp4 + fp8 scale
+
+so 2.5625 B/elem single-usage and 3.125 fused dual-usage. Amortized rows exclude
+the weight. Reference: a trivial bf16 copy sustains **6490 GB/s** on this GPU
+(measured), which is what these should be judged against rather than the 8 TB/s
+spec figure.
+
 ---
 
 # Part 1 — Dense
@@ -106,12 +133,16 @@ python benchmarks/linear/benchmark_nvfp4_quant_overhead.py \
     --layers fc1,dense_fc1 --iters 100 --repeats 7 --amortize-weight --step-total
 ```
 
-The scale-factor swizzle is fused into the cast by default (`optimize_for_gemm`),
-so no standalone swizzle pass exists in the timed path. This is *not* what
-`te.Linear` does today — `optimize_for_gemm` defaults to `False` and only the
-attention paths enable it, so Linear still re-swizzles inside every GEMM call.
-`--no-fused-swizzle` reproduces that behaviour; measured directly, the swizzle is
-only ~8–13 µs on these shapes.
+`optimize_for_gemm` is on by default. On this RHT-off path it does **not** fuse
+the swizzle into the cast — it *relocates* it: profiling one `update_quantized`
+shows 3 kernels and no swizzle with the flag off, versus 4 kernels including a
+separate 5.5 µs `swizzle_row_scaling_kernel` with it on. The swizzle moves out of
+the GEMM and into the cast call, which is why enabling it measures as roughly
+net-neutral. It is genuinely fused only on the RHT path (Part 2).
+
+This is also *not* what `te.Linear` does today — `optimize_for_gemm` defaults to
+`False` and only the attention paths enable it, so Linear still re-swizzles inside
+every GEMM call. `--no-fused-swizzle` reproduces that.
 
 Two shapes are reported: `fc1 (MoE)` is a DeepSeek-V3 MoE expert (58 of 61
 layers), `fc1 (dense)` is the dense MLP used in the first 3 layers.
@@ -127,29 +158,29 @@ the dense MLP: `intermediate_size = 18432`, fc1 `N = 36864`.
 
 ### Per-GEMM
 
-| layer | (M,N,K) | gemm | gemm us | quant us | total us | overhead us | quant % |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| fc1 (MoE) | (8192,4096,7168) | fprop | 83.1 | 54.1 | 156.7 | 73.5 | 46.9 |
-| fc1 (MoE) | (8192,4096,7168) | dgrad | 87.9 | 30.6 | 133.1 | 45.2 | 34.0 |
-| fc1 (MoE) | (8192,4096,7168) | wgrad | 85.4 | 115.1 | 205.7 | 120.3 | 58.5 |
-| fc1 (MoE) | (16384,4096,7168) | fprop | 164.2 | 96.2 | 288.7 | 124.5 | 43.1 |
-| fc1 (MoE) | (16384,4096,7168) | dgrad | 172.0 | 65.1 | 258.7 | 86.7 | 33.5 |
-| fc1 (MoE) | (16384,4096,7168) | wgrad | 168.0 | 198.4 | 385.6 | 217.6 | 56.4 |
-| fc1 (dense) | (8192,36864,7168) | fprop | 814.4 | 56.7 | 882.3 | 67.9 | 7.7 |
-| fc1 (dense) | (8192,36864,7168) | dgrad | 852.0 | 233.7 | 1075.2 | 223.2 | 20.8 |
-| fc1 (dense) | (8192,36864,7168) | wgrad | 796.4 | 356.3 | 1191.9 | 395.5 | 33.2 |
-| fc1 (dense) | (16384,36864,7168) | fprop | 1668.2 | 96.1 | 1764.8 | 96.6 | 5.5 |
-| fc1 (dense) | (16384,36864,7168) | dgrad | 1695.2 | 455.0 | 2168.3 | 473.0 | 21.8 |
-| fc1 (dense) | (16384,36864,7168) | wgrad | 1602.4 | 684.5 | 2342.0 | 739.6 | 31.6 |
+| layer | (M,N,K) | gemm | gemm us | quant us | amax us | cast us | cast GB/s | total us | overhead us | amax+cast % |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| fc1 (MoE) | (8192,4096,7168) | fprop | 84.8 | 54.5 | 25.3 | 29.1 | 5163 | 162.4 | 77.7 | 47.8 |
+| fc1 (MoE) | (8192,4096,7168) | dgrad | 89.4 | 30.2 | 13.7 | 16.5 | 5200 | 135.4 | 46.1 | 34.0 |
+| fc1 (MoE) | (8192,4096,7168) | wgrad | 85.9 | 115.8 | 42.4 | 73.4 | 3221 | 206.0 | 120.2 | 58.3 |
+| fc1 (MoE) | (16384,4096,7168) | fprop | 166.9 | 96.5 | 46.3 | 50.3 | 5986 | 287.1 | 120.2 | 41.9 |
+| fc1 (MoE) | (16384,4096,7168) | dgrad | 174.3 | 69.9 | 33.2 | 36.7 | 4686 | 259.0 | 84.8 | 32.7 |
+| fc1 (MoE) | (16384,4096,7168) | wgrad | 169.4 | 199.9 | 71.2 | 128.7 | 3676 | 396.5 | 227.1 | 57.3 |
+| fc1 (dense) | (8192,36864,7168) | fprop | 853.6 | 56.2 | 25.8 | 30.4 | 4942 | 913.7 | 60.1 | 6.6 |
+| fc1 (dense) | (8192,36864,7168) | dgrad | 867.1 | 234.8 | 114.6 | 120.3 | 6434 | 1126.1 | 258.9 | 23.0 |
+| fc1 (dense) | (8192,36864,7168) | wgrad | 825.3 | 356.7 | 122.8 | 233.9 | 3952 | 1200.5 | 375.2 | 31.3 |
+| fc1 (dense) | (16384,36864,7168) | fprop | 1742.4 | 100.0 | 48.6 | 51.4 | 5859 | 1838.6 | 96.2 | 5.2 |
+| fc1 (dense) | (16384,36864,7168) | dgrad | 1798.1 | 456.1 | 218.9 | 237.2 | 6525 | 2269.1 | 470.9 | 20.8 |
+| fc1 (dense) | (16384,36864,7168) | wgrad | 1693.3 | 689.8 | 231.3 | 458.5 | 4032 | 2365.0 | 671.6 | 28.4 |
 
 ### One training pass
 
-| layer | (M,N,K) | gemm us | quant us | total us | overhead us | quant % | GEMM TFLOP/s |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| fc1 (MoE) | (8192,4096,7168) | 263.9 | 128.5 | 427.8 | 164.0 | 38.3 | 5469 |
-| fc1 (MoE) | (16384,4096,7168) | 505.8 | 210.8 | 785.0 | 279.2 | 35.6 | 5706 |
-| fc1 (dense) | (8192,36864,7168) | 2522.6 | 391.1 | 2919.1 | 396.5 | 13.6 | 5149 |
-| fc1 (dense) | (16384,36864,7168) | 5000.4 | 748.5 | 5778.0 | 777.6 | 13.5 | 5195 |
+| layer | (M,N,K) | gemm us | quant us | amax us | cast us | cast GB/s | total us | overhead us | amax+cast % | GEMM TFLOP/s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| fc1 (MoE) | (8192,4096,7168) | 276.8 | 128.3 | 43.0 | 85.3 | 3379 | 426.4 | 149.7 | 35.1 | 5214 |
+| fc1 (MoE) | (16384,4096,7168) | 579.0 | 212.3 | 73.7 | 138.6 | 4161 | 789.4 | 210.3 | 26.6 | 4985 |
+| fc1 (dense) | (8192,36864,7168) | 2665.1 | 391.2 | 129.5 | 261.7 | 4308 | 3035.3 | 370.1 | 12.2 | 4873 |
+| fc1 (dense) | (16384,36864,7168) | 5295.2 | 754.1 | 247.0 | 507.1 | 4446 | 6097.9 | 802.6 | 13.2 | 4906 |
 
 ### Observations
 
@@ -162,13 +193,20 @@ bytes moved.
 operands columnwise, and unlike fprop/dgrad it cannot benefit from weight
 amortization, since neither of its operands is the weight.
 
-**The cast runs well below memory-bandwidth roofline.** Quantization is pure
-streaming: read bf16, write fp4 + fp8 scales = 2.5625 bytes/element. Against
-B200's ~8 TB/s HBM the measured cast lands at ~2.2–2.8 TB/s, roughly 30% of peak,
-and it stays near 30% across a 40x–1900 MB range. That flatness argues for a
-genuine kernel inefficiency rather than fixed per-launch overhead — closing it
-would cut the overhead figures by roughly 3x. Confirming that properly wants `ncu`
-on the cast kernel rather than wall-clock arithmetic.
+**The cast kernel is near bandwidth-saturated; the cost is the extra pass.**
+`cast GB/s` runs 3221–6525 against a 6490 GB/s copy rate — 50–100%. There is no
+slow kernel to fix.
+
+**The amax pass is the lever.** It is a separate full read of the tensor that
+buys no output, and `amax us` is **33–49% of `quant us`** in every row — for the
+dense step rows, 43.0 of 128.3 µs and 247.0 of 754.1 µs.
+Eliminating it (fusing amax into whatever produces the tensor, or a
+delayed/cached amax as FP8 recipes use) would cut quantization cost far more than
+any tuning of the cast itself.
+
+wgrad is weakest at 56–74%, matching the standalone columnwise cast at 58% —
+strided writes cannot reach copy bandwidth. fprop/dgrad on large dense shapes
+reach 86–93%.
 
 **Raising M does not help.** Dense holds at 13.6% -> 13.5% from M=8192 to 16384.
 Doubling M doubles GEMM and cast alike, so the ratio is scale-invariant.
@@ -212,38 +250,41 @@ python benchmarks/linear/benchmark_nvfp4_grouped_quant_overhead.py \
 > not ready yet"* (`pytorch/csrc/extensions/cast.cpp`), and post-RHT amax is
 > likewise required.
 
-### Per-GEMM
-
-| E | tok/E | (M,N,K) | gemm | gemm us | quant us | total us | overhead us | quant % |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 8 | 512 | (4096,4096,7168) | fprop | 61.0 | 38.7 | 113.4 | 52.4 | 46.2 |
-| 8 | 512 | (4096,4096,7168) | dgrad | 71.1 | 27.8 | 108.1 | 37.0 | 34.2 |
-| 8 | 512 | (4096,4096,7168) | wgrad | 126.9 | 80.1 | 217.3 | 90.4 | 41.6 |
-| 8 | 1024 | (8192,4096,7168) | fprop | 102.8 | 69.9 | 185.4 | 82.6 | 44.5 |
-| 8 | 1024 | (8192,4096,7168) | dgrad | 113.8 | 42.8 | 175.4 | 61.6 | 35.1 |
-| 8 | 1024 | (8192,4096,7168) | wgrad | 145.1 | 132.9 | 285.2 | 140.0 | 49.1 |
-| 8 | 2048 | (16384,4096,7168) | fprop | 185.8 | 113.6 | 322.3 | 136.5 | 42.3 |
-| 8 | 2048 | (16384,4096,7168) | dgrad | 196.5 | 84.1 | 293.4 | 96.9 | 33.0 |
-| 8 | 2048 | (16384,4096,7168) | wgrad | 227.7 | 219.9 | 469.1 | 241.4 | 51.5 |
-
 ### One training pass
 
-| E | tok/E | (M,N,K) | gemm us | quant us | total us | overhead us | quant % | GEMM TFLOP/s |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 8 | 512 | (4096,4096,7168) | 268.9 | 92.6 | 363.5 | 94.6 | 26.0 | 2683 |
-| 8 | 1024 | (8192,4096,7168) | 384.1 | 153.8 | 564.7 | 180.6 | 32.0 | 3757 |
-| 8 | 2048 | (16384,4096,7168) | 635.8 | 258.6 | 945.5 | 309.6 | 32.7 | 4539 |
+Only the fused dual-usage (`both`) cast is reported here: it is the one a real
+step performs, and it is the configuration where the scale swizzle is genuinely
+fused into the cast kernel rather than run as a separate pass.
+
+| E | tok/E | (M,N,K) | gemm us | quant us | amax us | cast us | cast GB/s | total us | overhead us | amax+cast % | GEMM TFLOP/s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 8 | 512 | (4096,4096,7168) | 269.4 | 95.5 | 28.4 | 67.1 | 2149 | 365.7 | 96.3 | 26.3 | 2679 |
+| 8 | 1024 | (8192,4096,7168) | 371.4 | 156.0 | 45.9 | 110.1 | 2618 | 567.4 | 196.0 | 34.5 | 3886 |
+| 8 | 2048 | (16384,4096,7168) | 681.3 | 259.3 | 72.8 | 186.5 | 3092 | 958.8 | 277.5 | 28.9 | 4237 |
+
+`cast us` here also absorbs the ~8 µs of per-call allocation and device-to-device
+copy that `tex.group_quantize` incurs (see caveats), so `cast GB/s` on this path
+is understated by a few percent.
 
 ### Observations
 
-**The grouped GEMM is what degrades at low occupancy, not the cast.** At 512
-tokens/expert the grouped GEMM manages 2683 TFLOP/s versus 4539 at 2048 — the
-whole `M=4096` problem is spread across 8 separate expert GEMMs, so each is small.
-`quant %` is *lowest* at 512 tok/E precisely because the GEMM is inefficient
-there, which inverts the shape effect seen in Part 1. Read the absolute
-`overhead us` rather than the percentage when comparing across `tok/E`.
+**The swizzle really is fused here.** Profiling `update_quantized` on the RHT
+path gives 3 kernels with `optimize_for_gemm` either on or off (72.1 vs 71.6 µs),
+and the cast kernel itself carries the swizzle. Contrast Part 1, where the flag
+adds a separate 5.5 µs swizzle kernel.
 
-**wgrad is again the worst per-GEMM**, 42–52%, for the same reason as Part 1.
+**amax is ~28–30% of `quant us`**, 28–73 µs — the same story as Part 1: a
+full-tensor read that produces no output.
+
+**Cast bandwidth is well below dense** — 2149–3092 GB/s (33–48% of the 6490 GB/s
+copy rate) versus 3221–6525 (50–100%) in Part 1, and it climbs steadily with
+tokens per expert. Part of that is the per-call allocation folded into `cast us`;
+the rest is the grouped cast being occupancy-limited at small per-expert counts.
+
+**`amax+cast %` is roughly flat at 26–35%** across a 4x range of tokens per
+expert, because both the GEMM and the cast scale with token count. GEMM efficiency
+does climb sharply (2679 -> 4237 TFLOP/s) as experts get more tokens, but the cast
+improves alongside it.
 
 ### Caveats
 
