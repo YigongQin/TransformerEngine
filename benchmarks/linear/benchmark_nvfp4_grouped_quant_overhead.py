@@ -74,6 +74,7 @@ import transformer_engine.pytorch as te  # noqa: F401  must be first per te-pyth
 import transformer_engine_torch as tex
 from transformer_engine.pytorch.cpp_extensions import general_grouped_gemm_for_grouped_tensor
 from transformer_engine.pytorch.tensor import GroupedTensor
+from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Quantizer
 
 # DeepSeek-V3 MoE expert FC1. TE fuses gate and up for gated activations
@@ -107,23 +108,41 @@ RESULT_COLUMNS = [
 ]
 
 
-def make_quantizer(usage, with_rht=True):
-    """NVFP4 quantizer for the grouped path. ``usage`` is rowwise/columnwise/both.
+# Bytes written per element, per usage: quantized datum + its block scale.
+RECIPES = {
+    "nvfp4": {"write_bytes": 0.5 + 1 / 16, "has_amax": True},
+    "mxfp8": {"write_bytes": 1.0 + 1 / 32, "has_amax": False},
+}
 
-    RHT and post-RHT amax are on by default because grouped NVFP4 quantization
-    has no non-RHT kernel; see the module docstring.
+
+def make_quantizer(usage, with_rht=True, recipe="nvfp4"):
+    """Quantizer for the grouped path. ``usage`` is rowwise/columnwise/both.
+
+    For NVFP4, RHT and post-RHT amax are on by default because grouped NVFP4
+    quantization has no non-RHT kernel; see the module docstring. MXFP8 has no
+    RHT and no global amax, so ``with_rht`` does not apply to it.
     """
-    quantizer = NVFP4Quantizer(
-        fp4_dtype=tex.DType.kFloat4E2M1,
-        rowwise=usage in ("rowwise", "both"),
-        columnwise=usage in ("columnwise", "both"),
-        with_amax_reduction=False,
-        with_rht=with_rht,
-        with_post_rht_amax=with_rht,
-        with_2d_quantization=False,
-        stochastic_rounding=False,
-        with_random_sign_mask=False,
-    )
+    rowwise = usage in ("rowwise", "both")
+    columnwise = usage in ("columnwise", "both")
+    if recipe == "mxfp8":
+        quantizer = MXFP8Quantizer(
+            fp8_dtype=tex.DType.kFloat8E4M3,
+            rowwise=rowwise,
+            columnwise=columnwise,
+            with_2d_quantization=False,
+        )
+    else:
+        quantizer = NVFP4Quantizer(
+            fp4_dtype=tex.DType.kFloat4E2M1,
+            rowwise=rowwise,
+            columnwise=columnwise,
+            with_amax_reduction=False,
+            with_rht=with_rht,
+            with_post_rht_amax=with_rht,
+            with_2d_quantization=False,
+            stochastic_rounding=False,
+            with_random_sign_mask=False,
+        )
     quantizer.optimize_for_gemm = True
     return quantizer
 
@@ -210,12 +229,12 @@ def quant_breakdown(run_quant, iters=20):
     return {k: v / iters for k, v in totals.items()}
 
 
-def add_cast_bandwidth(run_quant, row, parts, breakdown):
+def add_cast_bandwidth(run_quant, row, parts, breakdown, recipe="nvfp4"):
     """Return the amax/cast split plus the cast pass's achieved bandwidth."""
     if not breakdown:
         return {}
     out = scaled_breakdown(run_quant, row["quant_us"])
-    mb = cast_bytes(parts) / 1e6
+    mb = cast_bytes(parts, recipe) / 1e6
     cast_us = out.get("cast_us", 0.0)
     out["cast_mb"] = mb
     out["cast_gbps"] = mb / 1e3 / (cast_us * 1e-6) if cast_us > 0 else 0.0
@@ -241,12 +260,12 @@ def scaled_breakdown(run_quant, quant_us):
 # usage. The amax pass is a separate read and is excluded -- this is the
 # bandwidth of the cast kernel itself.
 CAST_READ_BYTES = 2.0  # bf16 input
-CAST_WRITE_BYTES = 0.5 + 1 / 16  # fp4 data + fp8 block scale
 
 
-def cast_bytes(parts):
+def cast_bytes(parts, recipe):
     """Bytes moved by the cast pass. ``parts`` is [(elems, n_usages), ...]."""
-    return sum(e * (CAST_READ_BYTES + n * CAST_WRITE_BYTES) for e, n in parts)
+    write = RECIPES[recipe]["write_bytes"]
+    return sum(e * (CAST_READ_BYTES + n * write) for e, n in parts)
 
 
 def summarize(label, experts, tokens, K, N, quant_us, gemm_us, total_us, num_gemms=1):
@@ -274,7 +293,7 @@ def summarize(label, experts, tokens, K, N, quant_us, gemm_us, total_us, num_gem
 class Operands:
     """High-precision inputs and their grouped/discrete NVFP4 destinations."""
 
-    def __init__(self, experts, tokens, K, N, with_rht):
+    def __init__(self, experts, tokens, K, N, with_rht, recipe="nvfp4"):
         self.experts, self.tokens, self.K, self.N = experts, tokens, K, N
         self.rows = experts * tokens
         self.first_dims = torch.tensor([tokens] * experts, dtype=torch.int64, device="cuda")
@@ -282,9 +301,10 @@ class Operands:
         self.dy_hp = torch.randn(self.rows, N, dtype=torch.bfloat16, device="cuda")
         self.w_hp = [torch.randn(N, K, dtype=torch.bfloat16, device="cuda") for _ in range(experts)]
         self.with_rht = with_rht
+        self.recipe = recipe
 
     def quantizer(self, usage):
-        return make_quantizer(usage, self.with_rht)
+        return make_quantizer(usage, self.with_rht, self.recipe)
 
     def grouped(self, packed, usage):
         return group_quantize(packed, self.quantizer(usage), self.first_dims, self.experts)
@@ -306,7 +326,7 @@ class Operands:
 
 def benchmark_one(gemm, experts, tokens, K, N, args, lead_fn):
     """Time gemm / quant / quant+gemm for one grouped training GEMM."""
-    ops = Operands(experts, tokens, K, N, args.with_rht)
+    ops = Operands(experts, tokens, K, N, args.with_rht, args.recipe)
     quantize_weight = not args.amortize_weight
 
     if gemm == "fprop":
@@ -371,7 +391,7 @@ def benchmark_step(experts, tokens, K, N, args, lead_fn):
     a real step group-quantizes each once with rowwise+columnwise usage rather
     than twice with a single usage.
     """
-    ops = Operands(experts, tokens, K, N, args.with_rht)
+    ops = Operands(experts, tokens, K, N, args.with_rht, args.recipe)
     w_quantizer = ops.quantizer("both")
     w_q = [w_quantizer(w) for w in ops.w_hp]
     x_q = ops.grouped(ops.x_hp, "both")
@@ -417,7 +437,7 @@ def benchmark_step(experts, tokens, K, N, args, lead_fn):
     parts = [(ops.rows * K, 2), (ops.rows * N, 2)]
     if not args.amortize_weight:
         parts.append((experts * N * K, 2))
-    row.update(add_cast_bandwidth(run_quant, row, parts, args.breakdown))
+    row.update(add_cast_bandwidth(run_quant, row, parts, args.breakdown, args.recipe))
     return row
 
 
@@ -436,7 +456,9 @@ def report(frame, title, per_gemm=True):
         columns.append("gemm")
     columns += ["gemm_us", "quant_us"]
     if "amax_us" in table:
-        columns += ["amax_us", "cast_us", "cast_gbps"]
+        if table["amax_us"].abs().max() > 0:
+            columns.append("amax_us")
+        columns += ["cast_us", "cast_gbps"]
     columns += ["total_us", "overhead_us", "quant_pct"]
     if not per_gemm:
         columns.append("gemm_tflops")
@@ -540,6 +562,16 @@ def parse_args():
             " so no separate swizzle time appears."
         ),
     )
+    parser.add_argument(
+        "--recipe",
+        choices=sorted(RECIPES),
+        default="nvfp4",
+        help=(
+            "Quantization recipe. nvfp4 is a two-pass cast (global amax, then cast)"
+            " and requires RHT on this path; mxfp8 has per-block E8M0 scales, no"
+            " global amax, and no RHT requirement."
+        ),
+    )
     parser.add_argument("--iters", type=int, default=50, help="Timed iterations per loop.")
     parser.add_argument(
         "--warmup",
@@ -569,8 +601,12 @@ def main():
 
     print(f"Device: {torch.cuda.get_device_name()} (SM{major}0)")
     print(
-        "Recipe: NVFP4 1D block scaling, grouped quantize + grouped GEMM,"
-        f" RHT={'on' if args.with_rht else 'off'} (grouped NVFP4 requires RHT)"
+        f"Recipe: {args.recipe.upper()}, grouped quantize + grouped GEMM"
+        + (
+            f", RHT={'on' if args.with_rht else 'off'} (grouped NVFP4 requires RHT)"
+            if args.recipe == "nvfp4"
+            else " (no amax, no RHT)"
+        )
     )
     print(
         f"experts={args.experts}, K={K}, N={N},"

@@ -88,6 +88,7 @@ from torch.profiler import ProfilerActivity, profile
 import transformer_engine.pytorch as te  # noqa: F401  must be first per te-python-import-order
 import transformer_engine_torch as tex
 from transformer_engine.pytorch.cpp_extensions import general_gemm
+from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Quantizer
 
 # ---------------------------------------------------------------------------
@@ -174,7 +175,16 @@ def gemm_operands(gemm, M, K, N):
     raise ValueError(f"unknown gemm '{gemm}'")
 
 
-def make_quantizer(usage, fused_swizzle=True):
+# Bytes written per element, per usage: quantized datum + its block scale.
+# NVFP4 = 4-bit data with an fp8 scale per 16 elements; MXFP8 = 8-bit data with
+# an E8M0 scale per 32. MXFP8 has no global amax, so its cast is a single pass.
+RECIPES = {
+    "nvfp4": {"write_bytes": 0.5 + 1 / 16, "has_amax": True},
+    "mxfp8": {"write_bytes": 1.0 + 1 / 32, "has_amax": False},
+}
+
+
+def make_quantizer(usage, fused_swizzle=True, recipe="nvfp4"):
     """Build a plain 1D NVFP4 quantizer: no RHT, stochastic rounding, or 2D scaling.
 
     ``usage`` is "rowwise", "columnwise", or "both".
@@ -185,17 +195,27 @@ def make_quantizer(usage, fused_swizzle=True):
     ``optimize_for_gemm`` defaults to False and only the attention paths enable
     it -- so Linear still pays a separate swizzle inside every GEMM call.
     """
-    quantizer = NVFP4Quantizer(
-        fp4_dtype=tex.DType.kFloat4E2M1,
-        rowwise=usage in ("rowwise", "both"),
-        columnwise=usage in ("columnwise", "both"),
-        with_amax_reduction=False,
-        with_rht=False,
-        with_post_rht_amax=False,
-        with_2d_quantization=False,
-        stochastic_rounding=False,
-        with_random_sign_mask=False,
-    )
+    rowwise = usage in ("rowwise", "both")
+    columnwise = usage in ("columnwise", "both")
+    if recipe == "mxfp8":
+        quantizer = MXFP8Quantizer(
+            fp8_dtype=tex.DType.kFloat8E4M3,
+            rowwise=rowwise,
+            columnwise=columnwise,
+            with_2d_quantization=False,
+        )
+    else:
+        quantizer = NVFP4Quantizer(
+            fp4_dtype=tex.DType.kFloat4E2M1,
+            rowwise=rowwise,
+            columnwise=columnwise,
+            with_amax_reduction=False,
+            with_rht=False,
+            with_post_rht_amax=False,
+            with_2d_quantization=False,
+            stochastic_rounding=False,
+            with_random_sign_mask=False,
+        )
     quantizer.optimize_for_gemm = fused_swizzle
     return quantizer
 
@@ -282,12 +302,12 @@ def quant_breakdown(run_quant, iters=20):
     return {k: v / iters for k, v in totals.items()}
 
 
-def add_cast_bandwidth(run_quant, row, parts, breakdown):
+def add_cast_bandwidth(run_quant, row, parts, breakdown, recipe="nvfp4"):
     """Return the amax/cast split plus the cast pass's achieved bandwidth."""
     if not breakdown:
         return {}
     out = scaled_breakdown(run_quant, row["quant_us"])
-    mb = cast_bytes(parts) / 1e6
+    mb = cast_bytes(parts, recipe) / 1e6
     cast_us = out.get("cast_us", 0.0)
     out["cast_mb"] = mb
     out["cast_gbps"] = mb / 1e3 / (cast_us * 1e-6) if cast_us > 0 else 0.0
@@ -313,12 +333,12 @@ def scaled_breakdown(run_quant, quant_us):
 # usage. The amax pass is a separate read and is excluded -- this is the
 # bandwidth of the cast kernel itself.
 CAST_READ_BYTES = 2.0  # bf16 input
-CAST_WRITE_BYTES = 0.5 + 1 / 16  # fp4 data + fp8 block scale
 
 
-def cast_bytes(parts):
+def cast_bytes(parts, recipe):
     """Bytes moved by the cast pass. ``parts`` is [(elems, n_usages), ...]."""
-    return sum(e * (CAST_READ_BYTES + n * CAST_WRITE_BYTES) for e, n in parts)
+    write = RECIPES[recipe]["write_bytes"]
+    return sum(e * (CAST_READ_BYTES + n * write) for e, n in parts)
 
 
 def summarize(label, M, K, N, quant_us, gemm_us, total_us, num_gemms=1):
@@ -348,8 +368,8 @@ def benchmark_one(gemm, M, K, N, args, lead_fn):
 
     a_hp = torch.randn(a_shape, dtype=torch.bfloat16, device=device)
     b_hp = torch.randn(b_shape, dtype=torch.bfloat16, device=device)
-    a_quantizer = make_quantizer(a_usage, args.fused_swizzle)
-    b_quantizer = make_quantizer(b_usage, args.fused_swizzle)
+    a_quantizer = make_quantizer(a_usage, args.fused_swizzle, args.recipe)
+    b_quantizer = make_quantizer(b_usage, args.fused_swizzle, args.recipe)
     a_q = quantize_into(a_quantizer, a_hp, a_shape, device, args.fused_swizzle)
     b_q = quantize_into(b_quantizer, b_hp, b_shape, device, args.fused_swizzle)
 
@@ -390,7 +410,7 @@ def benchmark_one(gemm, M, K, N, args, lead_fn):
         parts.append((a_shape[0] * a_shape[1], 1))
     if quant_b:
         parts.append((b_shape[0] * b_shape[1], 1))
-    row.update(add_cast_bandwidth(run_quant, row, parts, args.breakdown))
+    row.update(add_cast_bandwidth(run_quant, row, parts, args.breakdown, args.recipe))
     return row
 
 
@@ -409,7 +429,7 @@ def benchmark_step(M, K, N, args, lead_fn):
     w_hp = torch.randn((N, K), dtype=torch.bfloat16, device=device)
     dy_hp = torch.randn((M, N), dtype=torch.bfloat16, device=device)
 
-    xq, wq, dyq = (make_quantizer("both", fused) for _ in range(3))
+    xq, wq, dyq = (make_quantizer("both", fused, args.recipe) for _ in range(3))
     x_q = quantize_into(xq, x_hp, (M, K), device, fused)
     w_q = quantize_into(wq, w_hp, (N, K), device, fused)
     dy_q = quantize_into(dyq, dy_hp, (M, N), device, fused)
@@ -463,7 +483,7 @@ def benchmark_step(M, K, N, args, lead_fn):
     parts = [(M * K, 2), (M * N, 2)]
     if not args.amortize_weight:
         parts.append((N * K, 2))
-    row.update(add_cast_bandwidth(run_quant, row, parts, args.breakdown))
+    row.update(add_cast_bandwidth(run_quant, row, parts, args.breakdown, args.recipe))
     return row
 
 
@@ -485,7 +505,10 @@ def report(frame, title, per_gemm=True):
         columns.append("gemm")
     columns += ["gemm_us", "quant_us"]
     if "amax_us" in table:
-        columns += ["amax_us", "cast_us", "cast_gbps"]
+        # MXFP8 has no global amax pass, so the column would be all zeros.
+        if table["amax_us"].abs().max() > 0:
+            columns.append("amax_us")
+        columns += ["cast_us", "cast_gbps"]
     columns += ["total_us", "overhead_us", "quant_pct"]
     if not per_gemm:
         columns.append("gemm_tflops")
@@ -598,6 +621,15 @@ def parse_args():
             " a cast pass, and amax alone is roughly half the traffic."
         ),
     )
+    parser.add_argument(
+        "--recipe",
+        choices=sorted(RECIPES),
+        default="nvfp4",
+        help=(
+            "Quantization recipe. nvfp4 is a two-pass cast (global amax, then cast);"
+            " mxfp8 has per-block E8M0 scales and no global amax, so it is one pass."
+        ),
+    )
     parser.add_argument("--iters", type=int, default=50, help="Timed iterations per loop.")
     parser.add_argument(
         "--warmup",
@@ -647,7 +679,12 @@ def main():
     layers = resolve_layers(args.layers)
 
     print(f"Device: {torch.cuda.get_device_name()} (SM{major}0)")
-    print("Recipe: NVFP4 1D block scaling -- no RHT, no stochastic rounding, no 2D quantization")
+    if args.recipe == "mxfp8":
+        print("Recipe: MXFP8 (E4M3 data, E8M0 scale per 32) -- single-pass cast, no amax")
+    else:
+        print(
+            "Recipe: NVFP4 1D block scaling -- no RHT, no stochastic rounding, no 2D quantization"
+        )
     print(
         f"TP={args.tp}, amortize_weight={args.amortize_weight},"
         f" fused_swizzle={args.fused_swizzle}, warmup={args.warmup},"
