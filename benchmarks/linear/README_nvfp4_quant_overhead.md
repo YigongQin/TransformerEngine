@@ -4,8 +4,8 @@ How much of a quantized linear layer is quantization rather than math?
 
 | script | path measured |
 | --- | --- |
-| `benchmark_nvfp4_quant_overhead.py` | dense `general_gemm`, one shape at a time |
-| `benchmark_nvfp4_grouped_quant_overhead.py` | `group_quantize` + `general_grouped_gemm_for_grouped_tensor` across experts |
+| `benchmark_quant_overhead.py` | dense `general_gemm`, one shape at a time |
+| `benchmark_grouped_quant_overhead.py` | `group_quantize` + `general_grouped_gemm_for_grouped_tensor` across experts |
 
 MXFP8 results — one-pass cast, no global amax — are in
 [`README_mxfp8_quant_overhead.md`](README_mxfp8_quant_overhead.md).
@@ -42,9 +42,7 @@ fprop/dgrad/wgrad, and the step rows for the actual fraction.**
 Weight amortized, `--iters 100 --repeats 7`. Times in µs. Reference for
 `cast GB/s`: a trivial bf16 copy sustains **6490 GB/s** here.
 
-`gemm us` is reproducible to ±0.5% back-to-back, but **only within one clock
-state** — this GPU's boost ceiling has moved between sessions (1830 → 1965 MHz),
-shifting dense GEMM by 10–12%. Record the clock when comparing across runs.
+`gemm us` is reproducible to ±0.5% back-to-back.
 
 Requires Blackwell (SM100+); grouped GEMM additionally needs cuBLAS 13.3+.
 
@@ -55,7 +53,7 @@ Requires Blackwell (SM100+); grouped GEMM additionally needs cuBLAS 13.3+.
 Plain 1D NVFP4: no RHT, no stochastic rounding, no 2D scaling.
 
 ```bash
-python benchmarks/linear/benchmark_nvfp4_quant_overhead.py \
+python benchmarks/linear/benchmark_quant_overhead.py \
     --layers fc1,dense_fc1 --iters 100 --repeats 7 --amortize-weight --step-total --breakdown
 ```
 
@@ -136,7 +134,7 @@ group-cast, matching `ops/fused/grouped_mlp.py`. Same fc1 shape, `E=8` local
 experts (DeepSeek-V3 at EP=32).
 
 ```bash
-python benchmarks/linear/benchmark_nvfp4_grouped_quant_overhead.py \
+python benchmarks/linear/benchmark_grouped_quant_overhead.py \
     --experts 8 --tokens-per-expert 512,1024,2048 \
     --iters 100 --repeats 7 --amortize-weight --step-total --breakdown
 ```
@@ -154,22 +152,18 @@ cast kernel.
 
 | E | tok/E | (M,N,K) | gemm us | amax us | cast us | total us | overhead us | amax+cast % | GEMM TFLOP/s |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 8 | 512 | (4096,4096,7168) | 269.4 | 28.4 | 67.1 | 365.7 | 96.3 | 26.3 | 2679 |
-| 8 | 1024 | (8192,4096,7168) | 371.4 | 45.9 | 110.1 | 567.4 | 196.0 | 34.5 | 3886 |
-| 8 | 2048 | (16384,4096,7168) | 681.3 | 72.8 | 186.5 | 958.8 | 277.5 | 28.9 | 4237 |
-
-> These grouped numbers were measured at the earlier 1830 MHz clock ceiling and
-> are deliberately left unchanged. Their GEMM times are ~5% high relative to the
-> Part 1 tables above; the percentages are within a point.
+| 8 | 512 | (4096,4096,7168) | 269.0 | 28.3 | 65.3 | 365.0 | 96.0 | 26.3 | 2682 |
+| 8 | 1024 | (8192,4096,7168) | 363.7 | 47.5 | 107.9 | 526.1 | 162.5 | 30.9 | 3968 |
+| 8 | 2048 | (16384,4096,7168) | 629.6 | 74.8 | 184.1 | 890.5 | 260.9 | 29.3 | 4584 |
 
 ### Observations
 
 **The swizzle really is fused here** — 3 kernels with `optimize_for_gemm` on or
 off (72.1 vs 71.6 µs), versus Part 1 where the flag adds a separate kernel.
 
-**GEMM efficiency climbs sharply with tokens per expert** (2679 → 4237 TFLOP/s):
+**GEMM efficiency climbs sharply with tokens per expert** (2682 → 4584 TFLOP/s):
 at 512 tok/E the `M=4096` problem is split across 8 small expert GEMMs. The cast
-scales alongside, so `amax+cast %` stays roughly flat at 26–35%.
+scales alongside, so `amax+cast %` stays roughly flat at 26–31%.
 
 ### Caveats
 

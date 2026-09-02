@@ -4,8 +4,8 @@ The MXFP8 counterpart to [`README_nvfp4_quant_overhead.md`](README_nvfp4_quant_o
 Same scripts, method and shapes — only the recipe differs:
 
 ```bash
-python benchmarks/linear/benchmark_nvfp4_quant_overhead.py --recipe mxfp8 ...
-python benchmarks/linear/benchmark_nvfp4_grouped_quant_overhead.py --recipe mxfp8 ...
+python benchmarks/linear/benchmark_quant_overhead.py --recipe mxfp8 ...
+python benchmarks/linear/benchmark_grouped_quant_overhead.py --recipe mxfp8 ...
 ```
 
 ## What differs from NVFP4
@@ -43,16 +43,15 @@ Grouped MXFP8 has **no RHT requirement**, unlike grouped NVFP4.
 Weight amortized, `--iters 100 --repeats 7`. Times in µs. `cast GB/s` reference:
 a bf16 copy sustains **6490 GB/s** here.
 
-Every number on this page and every Part 1 number in the NVFP4 README were
-measured back-to-back in one session, so they are directly comparable. (The NVFP4
-*grouped* table is from an earlier clock state — see the note there.)
+Every number on this page and in the NVFP4 README was measured on the same
+machine and build, so they are directly comparable.
 
 ---
 
 # Part 1 — Dense
 
 ```bash
-python benchmarks/linear/benchmark_nvfp4_quant_overhead.py --recipe mxfp8 \
+python benchmarks/linear/benchmark_quant_overhead.py --recipe mxfp8 \
     --layers fc1,dense_fc1 --iters 100 --repeats 7 --amortize-weight --step-total --breakdown
 ```
 
@@ -89,7 +88,7 @@ python benchmarks/linear/benchmark_nvfp4_quant_overhead.py --recipe mxfp8 \
 Same recipe as Part 1 — no RHT needed. Only the fused dual-usage (`both`) cast.
 
 ```bash
-python benchmarks/linear/benchmark_nvfp4_grouped_quant_overhead.py --recipe mxfp8 \
+python benchmarks/linear/benchmark_grouped_quant_overhead.py --recipe mxfp8 \
     --experts 8 --tokens-per-expert 512,1024,2048 \
     --iters 100 --repeats 7 --amortize-weight --step-total --breakdown
 ```
@@ -114,10 +113,31 @@ python benchmarks/linear/benchmark_nvfp4_grouped_quant_overhead.py --recipe mxfp
 | fc1 (dense) M=16384 | 5.0% | 13.3% |
 
 **But that is not a free win.** Two effects pull the same way: the cast is
-cheaper (one pass) *and* the GEMM is slower (~2800 vs ~5600 TFLOP/s), so the same
-cast hides inside a longer GEMM. In absolute terms a dense fc1 step at M=16384
-takes **9839 µs under MXFP8 against 5348 µs under NVFP4** — MXFP8 buys a smaller
-quantization *fraction* by enlarging the denominator.
+cheaper (one pass) *and* the GEMM is slower, so the same cast hides inside a
+longer GEMM. MXFP8 buys a smaller quantization *fraction* by enlarging the
+denominator.
+
+### NVFP4 speedup over MXFP8 (grouped MoE)
+
+One training pass, MXFP8 time divided by NVFP4 time. `gemm` is the GEMMs alone;
+`layer` is cast + GEMM, i.e. what the layer actually costs.
+
+| tok/E | (M,N,K) | MXFP8 layer us | NVFP4 layer us | gemm speedup | **layer speedup** |
+| --- | --- | --- | --- | --- | --- |
+| 512 | (4096,4096,7168) | 443.4 | 365.0 | 1.35x | **1.21x** |
+| 1024 | (8192,4096,7168) | 735.2 | 526.1 | 1.74x | **1.40x** |
+| 2048 | (16384,4096,7168) | 1288.0 | 890.5 | 1.79x | **1.45x** |
+
+**The win grows with tokens per expert, 1.21x to 1.45x.** At 512 tok/E the NVFP4
+grouped GEMM is occupancy-limited — 2682 TFLOP/s against 4584 at 2048 — so it
+gives up most of its FP4 advantage before quantization is even counted: 1.35x on
+the GEMM alone, against 1.74x and 1.79x.
+
+**Quantization then erodes the rest.** NVFP4's cast costs roughly twice MXFP8's,
+which is subtracted from the GEMM win: 1.35x → 1.21x, 1.74x → 1.40x,
+1.79x → 1.45x. Removing NVFP4's amax pass would recover most of that — it is
+28.3 / 47.5 / 74.8 µs of a 365.0 / 526.1 / 890.5 µs layer, worth
+**1.32x / 1.54x / 1.58x** on its own.
 
 **The cast is bandwidth-saturated** — 5259–7070 GB/s against the 6490 GB/s copy
 reference, several rows at or above a plain copy. No headroom worth chasing,

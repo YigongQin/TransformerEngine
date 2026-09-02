@@ -2,9 +2,10 @@
 #
 # See LICENSE for license information.
 
-"""NVFP4 grouped-quantize + grouped-GEMM overhead for an MoE expert FC1.
+"""Grouped-quantize + grouped-GEMM overhead for an MoE expert FC1.
 
-The MoE counterpart to ``benchmark_nvfp4_quant_overhead.py``. That script issues a
+The MoE counterpart to ``benchmark_quant_overhead.py``; ``--recipe`` selects
+NVFP4 or MXFP8. That script issues a
 dense ``general_gemm`` at one expert's shape; this one drives the path TE actually
 uses for MoE -- ``tex.group_quantize`` into packed ``GroupedTensor`` storage, then
 ``general_grouped_gemm_for_grouped_tensor`` across all local experts in one launch.
@@ -57,10 +58,10 @@ overestimate of pure kernel time.
 Usage::
 
     # default: 8 local experts, sweep tokens/expert
-    python benchmarks/linear/benchmark_nvfp4_grouped_quant_overhead.py --step-total
+    python benchmarks/linear/benchmark_grouped_quant_overhead.py --step-total
 
     # DeepSeek-V3 with EP=32 (256 routed experts / 32 ranks = 8 local)
-    python benchmarks/linear/benchmark_nvfp4_grouped_quant_overhead.py \\
+    python benchmarks/linear/benchmark_grouped_quant_overhead.py \\
         --experts 8 --tokens-per-expert 512,1024,2048 --amortize-weight --step-total
 """
 

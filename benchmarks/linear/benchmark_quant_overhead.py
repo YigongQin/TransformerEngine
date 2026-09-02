@@ -2,11 +2,12 @@
 #
 # See LICENSE for license information.
 
-"""Measure NVFP4 quantization cost as a fraction of GEMM time, per training GEMM.
+"""Measure quantization cost as a fraction of GEMM time, per training GEMM.
 
-Answers "how much of my quantized linear layer is quantization, not math?" using
-plain 1D NVFP4 -- no RHT, no stochastic rounding, no 2D scaling -- and reports the
-three training GEMMs separately rather than rolled into one ``te.Linear`` number.
+Answers "how much of my quantized linear layer is quantization, not math?" and
+reports the three training GEMMs separately rather than rolled into one
+``te.Linear`` number. ``--recipe`` selects NVFP4 (plain 1D: no RHT, no stochastic
+rounding, no 2D scaling) or MXFP8.
 
 Method
 ------
@@ -49,22 +50,22 @@ Usage
 ::
 
     # all DeepSeek-V3 linear shapes, M in {8192, 16384}, all 3 GEMMs
-    python benchmarks/linear/benchmark_nvfp4_quant_overhead.py
+    python benchmarks/linear/benchmark_quant_overhead.py
 
     # FFN only, weight amortized across microbatches, plus the per-step total
-    python benchmarks/linear/benchmark_nvfp4_quant_overhead.py \\
+    python benchmarks/linear/benchmark_quant_overhead.py \\
         --layers ffn --amortize-weight --step-total
 
     # one shape, tensor-parallel sharded, results to CSV
-    python benchmarks/linear/benchmark_nvfp4_quant_overhead.py \\
+    python benchmarks/linear/benchmark_quant_overhead.py \\
         --layers fc1 -m 8192 --tp 8 -o fc1.csv
 
     # match te.Linear's current unfused-swizzle behaviour
-    python benchmarks/linear/benchmark_nvfp4_quant_overhead.py --no-fused-swizzle
+    python benchmarks/linear/benchmark_quant_overhead.py --no-fused-swizzle
 
     # profile a single shape
     nsys profile --trace=cuda,nvtx,cublas -o nvfp4_quant_overhead \\
-        python benchmarks/linear/benchmark_nvfp4_quant_overhead.py \\
+        python benchmarks/linear/benchmark_quant_overhead.py \\
         --layers fc1 -m 8192 --iters 20
 
 Interpreting the output
